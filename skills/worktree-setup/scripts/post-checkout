@@ -1,0 +1,267 @@
+#!/bin/sh
+# worktree-setup: dispatcher
+# Installed into GIT_COMMON_DIR/hooks/post-checkout.
+# Reads whitelist + bootstrap from the main worktree, not from the new checkout.
+
+set -eu
+
+old_head="${1-}"
+new_head="${2-}"
+flag="${3-}"
+
+chain() {
+	pre="$0.pre-worktree-setup"
+	if [ -x "$pre" ]; then
+		exec "$pre" "$old_head" "$new_head" "$flag"
+	fi
+	exit 0
+}
+
+is_null_oid() {
+	case "$1" in
+	'' ) return 1 ;;
+	*[!0]* ) return 1 ;;
+	esac
+	[ "${#1}" -ge 40 ]
+}
+
+# Git post-checkout: flag 1 = branch checkout (worktree add); 0 = file checkout.
+[ "$flag" = "1" ] || chain
+is_null_oid "$old_head" || chain
+
+git_dir=$(CDPATH= cd -P -- "$(git rev-parse --git-dir)" && pwd -P) || chain
+common=$(CDPATH= cd -P -- "$(git rev-parse --git-common-dir)" && pwd -P) || chain
+# Clone / main worktree: skip. Linked worktree only.
+[ "$git_dir" != "$common" ] || chain
+
+new_raw=$(git rev-parse --show-toplevel) || chain
+# Logical + physical: Git/macOS may report /var vs /private/var; pwd defaults to -L on macOS.
+new_log=$(CDPATH= cd -- "$new_raw" && pwd -L) || chain
+new_phys=$(CDPATH= cd -P -- "$new_raw" && pwd -P) || chain
+new=$new_phys
+main=""
+while IFS= read -r line; do
+	case "$line" in
+	worktree\ *)
+		main=${line#worktree }
+		break
+		;;
+	esac
+done <<EOF
+$(git worktree list --porcelain)
+EOF
+
+[ -n "$main" ] || chain
+main_log=$(CDPATH= cd -- "$main" && pwd -L) || chain
+main_phys=$(CDPATH= cd -P -- "$main" && pwd -P) || main_phys=$main_log
+main=$main_phys
+[ "$main" != "$new" ] || chain
+
+copy_list="$main/.worktree/copy"
+bootstrap="$main/.worktree/bootstrap.sh"
+[ -f "$copy_list" ] || [ -x "$bootstrap" ] || [ -f "$bootstrap" ] || chain
+
+status=0
+
+trim() {
+	t=$1
+	cr=$(printf '\r')
+	t=${t%"$cr"}
+	t=${t#"${t%%[![:space:]]*}"}
+	t=${t%"${t##*[![:space:]]}"}
+	printf '%s' "$t"
+}
+
+has_dotdot_component() {
+	p=$1
+	while [ "$p" != "${p%/}" ]; do
+		p=${p%/}
+	done
+	case "$p" in
+	.. | ../* | */.. | */../* ) return 0 ;;
+	esac
+	return 1
+}
+
+canon_path() {
+	p=$1
+	i=0
+	while [ -L "$p" ] && [ "$i" -lt 32 ]; do
+		t=$(readlink "$p") || return 1
+		case "$t" in
+		/* ) p=$t ;;
+		* )
+			d=$(dirname "$p")
+			# Resolve the parent so relative hops cannot hide behind leftover links.
+			if [ -d "$d" ]; then
+				d=$(CDPATH= cd -P -- "$d" && pwd -P) || return 1
+			fi
+			p="$d/$t"
+			;;
+		esac
+		i=$((i + 1))
+	done
+	# Still a symlink: cap hit or dangling cycle — caller must skip.
+	[ -L "$p" ] && return 1
+	if [ -d "$p" ]; then
+		(CDPATH= cd -P -- "$p" && pwd -P)
+	else
+		d=$(dirname "$p")
+		b=$(basename "$p")
+		(CDPATH= cd -P -- "$d" && printf '%s/%s\n' "$(pwd -P)" "$b")
+	fi
+}
+
+under_main() {
+	case "$1" in
+	"$main" | "$main"/* | "$main_phys" | "$main_phys"/* | "$main_log" | "$main_log"/* ) return 0 ;;
+	esac
+	return 1
+}
+
+under_new() {
+	case "$1" in
+	"$new" | "$new"/* | "$new_phys" | "$new_phys"/* | "$new_log" | "$new_log"/* ) return 0 ;;
+	esac
+	return 1
+}
+
+existing_ancestor() {
+	a=$1
+	while [ ! -e "$a" ] && [ ! -L "$a" ]; do
+		n=$(dirname "$a")
+		[ "$n" = "$a" ] && break
+		a=$n
+	done
+	printf '%s' "$a"
+}
+
+# After cp -R, drop dest copies of source symlinks that resolve outside main.
+strip_outside_symlinks() {
+	src_root=$1
+	dst_root=$2
+	[ -d "$dst_root" ] || return 0
+	find "$dst_root" -type l 2>/dev/null | while IFS= read -r dlink || [ -n "$dlink" ]; do
+		[ -n "$dlink" ] || continue
+		rel=${dlink#"$dst_root"/}
+		slink="$src_root/$rel"
+		[ -L "$slink" ] || continue
+		drop=0
+		resolved=$(canon_path "$slink") || drop=1
+		if [ "$drop" -eq 0 ] && ! under_main "$resolved"; then
+			drop=1
+		fi
+		if [ "$drop" -eq 1 ]; then
+			rm -f "$dlink"
+			echo "worktree-setup: skip symlink outside main: $rel" >&2
+		fi
+	done
+}
+
+copy_one() {
+	rel=$(trim "$1")
+	case "$rel" in
+	"" | \#* ) return 0 ;;
+	/* )
+		echo "worktree-setup: skip unsafe path: $rel" >&2
+		return 0
+		;;
+	esac
+	if has_dotdot_component "$rel"; then
+		echo "worktree-setup: skip unsafe path: $rel" >&2
+		return 0
+	fi
+	src="$main/$rel"
+	dst="$new/$rel"
+	if [ ! -e "$src" ] && [ ! -L "$src" ]; then
+		echo "worktree-setup: skip missing $rel" >&2
+		return 0
+	fi
+	# Resolve intermediate symlink components, not only when $src itself is a link.
+	resolved=$(canon_path "$src") || {
+		echo "worktree-setup: skip unresolvable $rel" >&2
+		return 0
+	}
+	if ! under_main "$resolved"; then
+		echo "worktree-setup: skip path outside main: $rel" >&2
+		return 0
+	fi
+	dst_dir=$(dirname "$dst")
+	dst_base=$(basename "$rel")
+	anc=$(existing_ancestor "$dst_dir")
+	if [ -e "$anc" ] || [ -L "$anc" ]; then
+		anc_res=$(canon_path "$anc") || {
+			echo "worktree-setup: skip unresolvable dest $rel" >&2
+			return 0
+		}
+		if ! under_new "$anc_res"; then
+			echo "worktree-setup: skip dest outside new worktree: $rel" >&2
+			return 0
+		fi
+	fi
+	if [ -e "$dst" ] || [ -L "$dst" ]; then
+		echo "worktree-setup: skip existing $rel" >&2
+		return 0
+	fi
+	mkdir -p "$dst_dir" || {
+		echo "worktree-setup: mkdir failed for $rel" >&2
+		status=1
+		return 0
+	}
+	dst_dir_res=$(canon_path "$dst_dir") || {
+		echo "worktree-setup: skip unresolvable dest $rel" >&2
+		status=1
+		return 0
+	}
+	if ! under_new "$dst_dir_res"; then
+		echo "worktree-setup: skip dest outside new worktree: $rel" >&2
+		return 0
+	fi
+	dst="$dst_dir_res/$dst_base"
+	if [ -e "$dst" ] || [ -L "$dst" ]; then
+		echo "worktree-setup: skip existing $rel" >&2
+		return 0
+	fi
+	if [ -d "$src" ] && [ ! -L "$src" ]; then
+		cp -R -P "$src" "$dst" || {
+			echo "worktree-setup: copy failed $rel" >&2
+			status=1
+			return 0
+		}
+		strip_outside_symlinks "$src" "$dst" || true
+	else
+		cp -p "$src" "$dst" || {
+			echo "worktree-setup: copy failed $rel" >&2
+			status=1
+			return 0
+		}
+	fi
+	echo "worktree-setup: copied $rel" >&2
+}
+
+if [ -f "$copy_list" ]; then
+	while IFS= read -r rel || [ -n "$rel" ]; do
+		copy_one "$rel"
+	done <"$copy_list"
+fi
+
+if [ -f "$bootstrap" ]; then
+	bstatus=0
+	if [ -x "$bootstrap" ]; then
+		WORKTREE_SETUP_MAIN="$main_phys" WORKTREE_SETUP_NEW="$new" "$bootstrap" || bstatus=$?
+	else
+		WORKTREE_SETUP_MAIN="$main_phys" WORKTREE_SETUP_NEW="$new" sh "$bootstrap" || bstatus=$?
+	fi
+	if [ "$bstatus" -ne 0 ]; then
+		status=$bstatus
+		echo "worktree-setup: bootstrap failed ($bstatus)" >&2
+		echo "worktree-setup: retry with WORKTREE_SETUP_MAIN=$main_phys WORKTREE_SETUP_NEW=$new sh \"$bootstrap\"" >&2
+	fi
+fi
+
+pre="$0.pre-worktree-setup"
+if [ -x "$pre" ]; then
+	"$pre" "$old_head" "$new_head" "$flag" || status=$?
+fi
+
+exit "$status"
