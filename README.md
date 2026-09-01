@@ -4,4 +4,4 @@
 
 ## 技能
 
-- [worktree-setup](skills/worktree-setup/SKILL.md) — 一次性 Git-only 配置：之后 `git worktree add` 会复制白名单（如 `.env`）并跑 bootstrap。不依赖 wt/Worktrunk。
+- [worktree-setup](skills/worktree-setup/SKILL.md) — 一次性 Git-only 配置：之后 `git worktree add` 会复制白名单（如 `.env`）并跑 bootstrap。
